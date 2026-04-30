@@ -9,6 +9,8 @@ const state = {
   video: null,
   stream: null,
   orientation: { alpha: 0, beta: 0, gamma: 0 },
+  compassHeading: null,
+  yawOffset: null,
   screenAngle: 0,
   targets: buildTargets(),
   captures: [],
@@ -20,6 +22,10 @@ const state = {
 
 const HOLD_MS = 600;
 const ALIGN_TOLERANCE_DEG = 8;
+// iPhone main back camera, portrait orientation (sensor short side = screen width).
+const FOV_X_DEG = 46;
+const FOV_Y_DEG = 75;
+const DEG = Math.PI / 180;
 
 // --- screens ---
 function show(id) {
@@ -77,11 +83,21 @@ async function acquireWakeLock() {
 
 // --- orientation ---
 function attachOrientation() {
-  window.addEventListener('deviceorientation', (e) => {
+  const handler = (e) => {
     state.orientation.alpha = e.alpha ?? 0;
     state.orientation.beta = e.beta ?? 0;
     state.orientation.gamma = e.gamma ?? 0;
-  }, true);
+    if (typeof e.webkitCompassHeading === 'number' && !isNaN(e.webkitCompassHeading)) {
+      state.compassHeading = e.webkitCompassHeading;
+    }
+    // First reading: zero our yaw to wherever the user starts pointing.
+    if (state.yawOffset === null) {
+      state.yawOffset = state.compassHeading != null ? state.compassHeading : state.orientation.alpha;
+    }
+  };
+  window.addEventListener('deviceorientation', handler, true);
+  // Safari fires deviceorientationabsolute on some devices with a real compass.
+  window.addEventListener('deviceorientationabsolute', handler, true);
   const onScreenAngle = () => {
     state.screenAngle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
   };
@@ -90,17 +106,49 @@ function attachOrientation() {
   if (screen.orientation) screen.orientation.addEventListener('change', onScreenAngle);
 }
 
-// Convert device orientation -> camera yaw/pitch (where the back camera is pointing).
-// Approximation good enough for stitching when phone held vertically.
-function cameraYawPitch() {
+// Where the back camera is pointing in world frame. Yaw is referenced to wherever
+// the user started (yawOffset captured on first reading) so drift is bounded.
+function cameraOrientation() {
   const { alpha, beta, gamma } = state.orientation;
-  // Phone vertical, back camera horizontal: yaw ~ alpha, pitch ~ beta - 90.
-  let yaw = -alpha;
-  let pitch = beta - 90;
-  // wrap
+  const offset = state.yawOffset ?? 0;
+  let rawYaw = state.compassHeading != null ? state.compassHeading : -alpha;
+  // webkitCompassHeading: 0=north, increases clockwise → camera-pan-right increases.
+  // alpha: increases counter-clockwise from start → invert sign for camera-pan-right.
+  let yaw = (state.compassHeading != null) ? (rawYaw - offset) : (-alpha - (-offset));
   yaw = ((yaw + 540) % 360) - 180;
-  pitch = Math.max(-90, Math.min(90, pitch));
-  return { yaw, pitch };
+  const pitch = Math.max(-90, Math.min(90, beta - 90));
+  // gamma is roll around the device's Y axis. In portrait, that's screen roll.
+  const roll = gamma;
+  return { yaw, pitch, roll };
+}
+
+// Build a world->camera rotation matrix. Same convention as stitch.js.
+function rotMatWorldToCamera(yawDeg, pitchDeg, rollDeg) {
+  const y = -yawDeg * DEG, p = -pitchDeg * DEG, r = -rollDeg * DEG;
+  const cy = Math.cos(y), sy = Math.sin(y);
+  const cp = Math.cos(p), sp = Math.sin(p);
+  const cr = Math.cos(r), sr = Math.sin(r);
+  const Ry = [[cy,0,sy],[0,1,0],[-sy,0,cy]];
+  const Rx = [[1,0,0],[0,cp,-sp],[0,sp,cp]];
+  const Rz = [[cr,-sr,0],[sr,cr,0],[0,0,1]];
+  return mm(mm(Rz, Rx), Ry);
+}
+function mm(A, B) {
+  const C = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let i=0;i<3;i++) for (let j=0;j<3;j++)
+    C[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j];
+  return C;
+}
+function rv(R, v) {
+  return [
+    R[0][0]*v[0]+R[0][1]*v[1]+R[0][2]*v[2],
+    R[1][0]*v[0]+R[1][1]*v[1]+R[1][2]*v[2],
+    R[2][0]*v[0]+R[2][1]*v[1]+R[2][2]*v[2],
+  ];
+}
+function dirYawPitch(yawDeg, pitchDeg) {
+  const y = yawDeg * DEG, p = pitchDeg * DEG;
+  return [Math.cos(p) * Math.sin(y), Math.sin(p), Math.cos(p) * Math.cos(y)];
 }
 
 // --- capture loop ---
@@ -117,7 +165,7 @@ function angularDistance(a, b) {
 function captureLoop(ts) {
   if (!state.video) return;
   drawOverlay();
-  const here = cameraYawPitch();
+  const here = cameraOrientation();
 
   // find nearest uncaptured target
   let best = null, bestDist = Infinity;
@@ -152,8 +200,8 @@ function grabFrame(target) {
   const canvas = document.createElement('canvas');
   canvas.width = w; canvas.height = h;
   canvas.getContext('2d').drawImage(v, 0, 0, w, h);
-  const here = cameraYawPitch();
-  state.captures.push({ canvas, yaw: here.yaw, pitch: here.pitch, roll: state.orientation.gamma });
+  const here = cameraOrientation();
+  state.captures.push({ canvas, yaw: here.yaw, pitch: here.pitch, roll: here.roll });
   target.captured = true;
   $('counter').textContent = `${state.captures.filter(()=>true).length} / ${state.targets.length}`;
   setTimeout(() => { state.capturing = false; }, 250);
@@ -171,39 +219,56 @@ function drawOverlay() {
   const ctx = c.getContext('2d');
   ctx.clearRect(0, 0, W, H);
 
-  const here = cameraYawPitch();
-  const fovX = 65; // approx iPhone back cam horizontal FOV
-  const fovY = fovX * (H / W);
+  const here = cameraOrientation();
+  const R = rotMatWorldToCamera(here.yaw, here.pitch, here.roll);
+  const fx = (W / 2) / Math.tan(FOV_X_DEG / 2 * DEG);
+  const fy = (H / 2) / Math.tan(FOV_Y_DEG / 2 * DEG);
+
+  const project = (worldYaw, worldPitch) => {
+    const v = rv(R, dirYawPitch(worldYaw, worldPitch));
+    if (v[2] <= 0.05) return null; // behind camera
+    return { x: W/2 + fx * v[0] / v[2], y: H/2 - fy * v[1] / v[2], depth: v[2] };
+  };
+
+  // horizon line (great circle at pitch=0) — gives a stable visual anchor
+  ctx.strokeStyle = 'rgba(255,255,255,0.18)';
+  ctx.lineWidth = 1*dpr;
+  ctx.beginPath();
+  let started = false;
+  for (let yawW = -180; yawW <= 180; yawW += 2) {
+    const p = project(yawW, 0);
+    if (!p || p.x < -50 || p.x > W+50 || p.y < -50 || p.y > H+50) { started = false; continue; }
+    if (!started) { ctx.moveTo(p.x, p.y); started = true; } else { ctx.lineTo(p.x, p.y); }
+  }
+  ctx.stroke();
 
   for (const t of state.targets) {
-    const dy = ((t.yaw - here.yaw + 540) % 360) - 180;
-    const dp = t.pitch - here.pitch;
-    if (Math.abs(dy) > fovX || Math.abs(dp) > fovY) continue;
-    const x = W/2 + (dy / (fovX/2)) * (W/2);
-    const y = H/2 - (dp / (fovY/2)) * (H/2);
+    const p = project(t.yaw, t.pitch);
+    if (!p) continue;
+    if (p.x < -40 || p.x > W+40 || p.y < -40 || p.y > H+40) continue;
     const aligned = state.alignedTarget === t;
     ctx.beginPath();
-    ctx.arc(x, y, t.captured ? 14*dpr : (aligned ? 22*dpr : 16*dpr), 0, Math.PI*2);
+    ctx.arc(p.x, p.y, t.captured ? 14*dpr : (aligned ? 22*dpr : 16*dpr), 0, Math.PI*2);
     if (t.captured) {
       ctx.fillStyle = 'rgba(60,200,120,0.85)';
       ctx.fill();
       ctx.strokeStyle = '#fff'; ctx.lineWidth = 2*dpr;
       ctx.beginPath();
-      ctx.moveTo(x-5*dpr, y); ctx.lineTo(x-1*dpr, y+5*dpr); ctx.lineTo(x+6*dpr, y-4*dpr);
+      ctx.moveTo(p.x-5*dpr, p.y); ctx.lineTo(p.x-1*dpr, p.y+5*dpr); ctx.lineTo(p.x+6*dpr, p.y-4*dpr);
       ctx.stroke();
     } else {
-      ctx.fillStyle = aligned ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.25)';
+      ctx.fillStyle = aligned ? 'rgba(255,255,255,0.95)' : 'rgba(255,255,255,0.30)';
       ctx.fill();
       ctx.strokeStyle = '#fff'; ctx.lineWidth = 2*dpr; ctx.stroke();
     }
   }
 
-  // crosshair
-  ctx.strokeStyle = 'rgba(255,255,255,0.5)';
+  // fixed-on-screen crosshair (this one IS supposed to track the phone)
+  ctx.strokeStyle = 'rgba(255,255,255,0.65)';
   ctx.lineWidth = 1.5*dpr;
   ctx.beginPath();
-  ctx.moveTo(W/2 - 12*dpr, H/2); ctx.lineTo(W/2 + 12*dpr, H/2);
-  ctx.moveTo(W/2, H/2 - 12*dpr); ctx.lineTo(W/2, H/2 + 12*dpr);
+  ctx.moveTo(W/2 - 14*dpr, H/2); ctx.lineTo(W/2 + 14*dpr, H/2);
+  ctx.moveTo(W/2, H/2 - 14*dpr); ctx.lineTo(W/2, H/2 + 14*dpr);
   ctx.stroke();
 }
 
@@ -221,7 +286,7 @@ async function finish() {
 
   await new Promise(r => setTimeout(r, 50));
   const equirect = await stitchEquirectangular(state.captures, {
-    width: 4096, height: 2048, fovDeg: 65,
+    width: 4096, height: 2048, fovXDeg: FOV_X_DEG, fovYDeg: FOV_Y_DEG,
     onProgress: (p) => { $('stitch-status').textContent = `Stitching… ${Math.round(p*100)}%`; },
   });
 
@@ -306,6 +371,8 @@ function teardownAndReset() {
   if (state.wakeLock) { try { state.wakeLock.release(); } catch {} state.wakeLock = null; }
   state.captures = [];
   state.targets = buildTargets();
+  state.yawOffset = null;
+  state.compassHeading = null;
   $('counter').textContent = `0 / ${state.targets.length}`;
   show('start-screen');
 }

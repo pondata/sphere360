@@ -36,15 +36,16 @@ function applyR(R, v) {
 
 export async function stitchEquirectangular(captures, opts) {
   const W = opts.width, H = opts.height;
-  const fov = opts.fovDeg * DEG;
+  const fovX = (opts.fovXDeg ?? opts.fovDeg ?? 65) * DEG;
+  const fovY = (opts.fovYDeg ?? opts.fovDeg ?? 65) * DEG;
   const onProgress = opts.onProgress || (() => {});
 
   // pre-extract source pixel data
   const sources = captures.map(c => {
     const ctx = c.canvas.getContext('2d');
     const img = ctx.getImageData(0, 0, c.canvas.width, c.canvas.height);
-    const fx = (c.canvas.width / 2) / Math.tan(fov / 2);
-    const fy = fx; // assume square pixels
+    const fx = (c.canvas.width / 2) / Math.tan(fovX / 2);
+    const fy = (c.canvas.height / 2) / Math.tan(fovY / 2);
     return {
       data: img.data,
       W: c.canvas.width, H: c.canvas.height,
