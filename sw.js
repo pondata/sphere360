@@ -1,4 +1,4 @@
-const CACHE = 'sphere360-v3';
+const CACHE = 'sphere360-v4';
 const ASSETS = [
   './',
   './index.html',

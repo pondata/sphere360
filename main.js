@@ -20,7 +20,10 @@ const state = {
 };
 
 const HOLD_MS = 600;
-const ALIGN_TOLERANCE_DEG = 8;
+// Screen-space tolerance: distance from the crosshair, normalized so the
+// horizontal half-screen = 1 and the vertical half-screen = 1. ~0.18 ≈ a
+// small circle around the center on a portrait phone.
+const ALIGN_SCREEN_TOLERANCE = 0.18;
 // iPhone main back camera, portrait orientation (sensor short side = screen width).
 const FOV_X_DEG = 46;
 const FOV_Y_DEG = 75;
@@ -172,18 +175,24 @@ function captureLoop(ts) {
   if (!state.video) return;
   drawOverlay();
 
-  // Find nearest uncaptured target via dot product against the camera forward
-  // direction — avoids any Euler decomposition.
-  const f = cameraForwardUserWorld();
-  let best = null, bestDot = -Infinity;
+  // Pick the target whose projected screen position is closest to the crosshair.
+  // Using projected distance (rather than angular distance) is what matches the
+  // user's eye, since FOV_X ≠ FOV_Y on a portrait phone.
+  const Rwd = currentRwd();
+  const tanX = Math.tan(FOV_X_DEG / 2 * DEG);
+  const tanY = Math.tan(FOV_Y_DEG / 2 * DEG);
+  let best = null, bestScreenDist = Infinity;
   for (const t of state.targets) {
     if (t.captured) continue;
-    const td = targetDirUserWorld(t.yaw, t.pitch);
-    const d = f[0]*td[0] + f[1]*td[1] + f[2]*td[2];
-    if (d > bestDot) { bestDot = d; best = t; }
+    const td = applyMat(Rwd, targetDirUserWorld(t.yaw, t.pitch));
+    if (td[2] >= 0) continue; // behind back camera
+    const nx = (td[0] / (-td[2])) / tanX;
+    const ny = (td[1] / (-td[2])) / tanY;
+    const sd = Math.hypot(nx, ny);
+    if (sd < bestScreenDist) { bestScreenDist = sd; best = t; }
   }
-  const bestDist = Math.acos(Math.max(-1, Math.min(1, bestDot))) / DEG;
-  const aligned = best && bestDist < ALIGN_TOLERANCE_DEG;
+
+  const aligned = best && bestScreenDist < ALIGN_SCREEN_TOLERANCE;
   if (aligned) {
     if (state.alignedTarget !== best) {
       state.alignedTarget = best;
@@ -194,7 +203,13 @@ function captureLoop(ts) {
     $('status').textContent = state.capturing ? 'captured ✓' : `hold still… ${Math.max(0, Math.round((HOLD_MS - (ts - state.alignedSince))/100)/10)}s`;
   } else {
     state.alignedTarget = null;
-    $('status').textContent = best ? `aim at the bright dot (${Math.round(bestDist)}°)` : 'all dots captured — tap Finish';
+    if (state.targets.every(t => t.captured)) {
+      $('status').textContent = 'all dots captured — tap Finish';
+    } else if (best) {
+      $('status').textContent = 'aim the crosshair at the nearest dot';
+    } else {
+      $('status').textContent = 'rotate to find a dot';
+    }
   }
 
   requestAnimationFrame(captureLoop);
