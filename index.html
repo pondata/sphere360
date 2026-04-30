@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no,viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="Sphere360" />
+<meta name="theme-color" content="#000000" />
+<title>Sphere360</title>
+<link rel="manifest" href="manifest.json" />
+<link rel="apple-touch-icon" href="icon-180.png" />
+<link rel="icon" type="image/png" sizes="192x192" href="icon-192.png" />
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+<div id="app">
+
+  <div id="start-screen" class="screen">
+    <h1>Sphere360</h1>
+    <p>Capture a full 360° photo sphere with your iPhone.</p>
+    <ol>
+      <li>Hold phone vertical, arm extended.</li>
+      <li>Aim camera at each glowing dot.</li>
+      <li>Stay still — it auto-captures.</li>
+    </ol>
+    <button id="start-btn">Start</button>
+    <p class="hint">Requires Safari + HTTPS. Camera and motion access required.</p>
+  </div>
+
+  <div id="capture-screen" class="screen hidden">
+    <video id="video" playsinline muted autoplay></video>
+    <canvas id="overlay"></canvas>
+    <div id="hud">
+      <div id="counter">0 / 26</div>
+      <div id="status">aligning…</div>
+      <button id="finish-btn" class="ghost">Finish</button>
+      <button id="cancel-btn" class="ghost">Cancel</button>
+    </div>
+  </div>
+
+  <div id="stitch-screen" class="screen hidden">
+    <div class="spinner"></div>
+    <p id="stitch-status">Stitching sphere…</p>
+  </div>
+
+  <div id="result-screen" class="screen hidden">
+    <div id="viewer-container"></div>
+    <div id="result-actions">
+      <a id="download-link" download="sphere360.jpg"><button>Download JPEG</button></a>
+      <button id="restart-btn" class="ghost">Capture another</button>
+    </div>
+    <p class="hint">Image includes GPano metadata so Facebook / Google Photos render it as a sphere.</p>
+  </div>
+
+</div>
+
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js"
+  }
+}
+</script>
+<script type="module" src="main.js"></script>
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('sw.js').catch(() => {});
+  });
+}
+</script>
+</body>
+</html>
