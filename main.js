@@ -9,8 +9,7 @@ const state = {
   video: null,
   stream: null,
   orientation: { alpha: 0, beta: 0, gamma: 0 },
-  compassHeading: null,
-  yawOffset: null,
+  initialR: null, // device->earth rotation captured on first reading; defines user-world frame
   screenAngle: 0,
   targets: buildTargets(),
   captures: [],
@@ -84,19 +83,15 @@ async function acquireWakeLock() {
 // --- orientation ---
 function attachOrientation() {
   const handler = (e) => {
-    state.orientation.alpha = e.alpha ?? 0;
-    state.orientation.beta = e.beta ?? 0;
-    state.orientation.gamma = e.gamma ?? 0;
-    if (typeof e.webkitCompassHeading === 'number' && !isNaN(e.webkitCompassHeading)) {
-      state.compassHeading = e.webkitCompassHeading;
-    }
-    // First reading: zero our yaw to wherever the user starts pointing.
-    if (state.yawOffset === null) {
-      state.yawOffset = state.compassHeading != null ? state.compassHeading : state.orientation.alpha;
+    if (e.alpha == null || e.beta == null || e.gamma == null) return;
+    state.orientation.alpha = e.alpha;
+    state.orientation.beta = e.beta;
+    state.orientation.gamma = e.gamma;
+    if (state.initialR === null) {
+      state.initialR = deviceToEarth(e.alpha, e.beta, e.gamma);
     }
   };
   window.addEventListener('deviceorientation', handler, true);
-  // Safari fires deviceorientationabsolute on some devices with a real compass.
   window.addEventListener('deviceorientationabsolute', handler, true);
   const onScreenAngle = () => {
     state.screenAngle = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
@@ -106,75 +101,88 @@ function attachOrientation() {
   if (screen.orientation) screen.orientation.addEventListener('change', onScreenAngle);
 }
 
-// Where the back camera is pointing in world frame. Yaw is referenced to wherever
-// the user started (yawOffset captured on first reading) so drift is bounded.
-function cameraOrientation() {
-  const { alpha, beta, gamma } = state.orientation;
-  const offset = state.yawOffset ?? 0;
-  let rawYaw = state.compassHeading != null ? state.compassHeading : -alpha;
-  // webkitCompassHeading: 0=north, increases clockwise → camera-pan-right increases.
-  // alpha: increases counter-clockwise from start → invert sign for camera-pan-right.
-  let yaw = (state.compassHeading != null) ? (rawYaw - offset) : (-alpha - (-offset));
-  yaw = ((yaw + 540) % 360) - 180;
-  const pitch = Math.max(-90, Math.min(90, beta - 90));
-  // gamma is roll around the device's Y axis. In portrait, that's screen roll.
-  const roll = gamma;
-  return { yaw, pitch, roll };
-}
-
-// Build a world->camera rotation matrix. Same convention as stitch.js.
-function rotMatWorldToCamera(yawDeg, pitchDeg, rollDeg) {
-  const y = -yawDeg * DEG, p = -pitchDeg * DEG, r = -rollDeg * DEG;
-  const cy = Math.cos(y), sy = Math.sin(y);
-  const cp = Math.cos(p), sp = Math.sin(p);
-  const cr = Math.cos(r), sr = Math.sin(r);
-  const Ry = [[cy,0,sy],[0,1,0],[-sy,0,cy]];
-  const Rx = [[1,0,0],[0,cp,-sp],[0,sp,cp]];
-  const Rz = [[cr,-sr,0],[sr,cr,0],[0,0,1]];
-  return mm(mm(Rz, Rx), Ry);
-}
-function mm(A, B) {
-  const C = [[0,0,0],[0,0,0],[0,0,0]];
-  for (let i=0;i<3;i++) for (let j=0;j<3;j++)
-    C[i][j] = A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j];
-  return C;
-}
-function rv(R, v) {
+// W3C DeviceOrientation: device->earth rotation matrix R = Rz(α)·Rx(β)·Ry(γ)
+// applied to the device frame (X=right, Y=top, Z=out-of-screen) to get earth frame.
+function deviceToEarth(alphaDeg, betaDeg, gammaDeg) {
+  const a = alphaDeg * DEG, b = betaDeg * DEG, g = gammaDeg * DEG;
+  const ca = Math.cos(a), sa = Math.sin(a);
+  const cb = Math.cos(b), sb = Math.sin(b);
+  const cg = Math.cos(g), sg = Math.sin(g);
   return [
-    R[0][0]*v[0]+R[0][1]*v[1]+R[0][2]*v[2],
-    R[1][0]*v[0]+R[1][1]*v[1]+R[1][2]*v[2],
-    R[2][0]*v[0]+R[2][1]*v[1]+R[2][2]*v[2],
+    [ ca*cg - sa*sb*sg, -sa*cb, ca*sg + sa*sb*cg ],
+    [ sa*cg + ca*sb*sg,  ca*cb, sa*sg - ca*sb*cg ],
+    [          -cb*sg,      sb,            cb*cg ],
   ];
 }
-function dirYawPitch(yawDeg, pitchDeg) {
+
+// Mat3 helpers
+function applyMat(M, v) {
+  return [
+    M[0][0]*v[0] + M[0][1]*v[1] + M[0][2]*v[2],
+    M[1][0]*v[0] + M[1][1]*v[1] + M[1][2]*v[2],
+    M[2][0]*v[0] + M[2][1]*v[1] + M[2][2]*v[2],
+  ];
+}
+// Returns Aᵀ · B
+function tmm(A, B) {
+  const C = [[0,0,0],[0,0,0],[0,0,0]];
+  for (let i=0;i<3;i++) for (let j=0;j<3;j++)
+    C[i][j] = A[0][i]*B[0][j] + A[1][i]*B[1][j] + A[2][i]*B[2][j];
+  return C;
+}
+
+// User-world direction for a target at (yaw, pitch).
+// Convention: yaw=0,pitch=0 is the camera's forward direction at start (device -Z at t0).
+//   yaw  -> rotation around user-world +Y (vertical, up)
+//   pitch -> tilt up
+function targetDirUserWorld(yawDeg, pitchDeg) {
   const y = yawDeg * DEG, p = pitchDeg * DEG;
-  return [Math.cos(p) * Math.sin(y), Math.sin(p), Math.cos(p) * Math.cos(y)];
+  return [
+     Math.sin(y) * Math.cos(p),
+     Math.sin(p),
+    -Math.cos(y) * Math.cos(p),
+  ];
+}
+
+// R that maps user-world vectors into the current device frame.
+// user-world ≡ device frame at t0, so:
+//   v_device(t) = deviceToEarth(t)ᵀ · deviceToEarth(t0) · v_userworld
+function currentRwd() {
+  if (!state.initialR) return [[1,0,0],[0,1,0],[0,0,1]];
+  const Rcur = deviceToEarth(state.orientation.alpha, state.orientation.beta, state.orientation.gamma);
+  return tmm(Rcur, state.initialR);
+}
+
+// Camera forward in user-world (back camera looks down device -Z).
+//   forward_userworld = (R_device_to_userworld) · (0,0,-1) = Rwdᵀ · (0,0,-1) = -[col 2 of Rwd]
+function cameraForwardUserWorld() {
+  const R = currentRwd();
+  return [-R[0][2], -R[1][2], -R[2][2]];
+}
+
+// Convert a unit forward direction to (yaw, pitch) under our convention.
+function dirToYawPitch(d) {
+  const pitch = Math.asin(Math.max(-1, Math.min(1, d[1]))) / DEG;
+  const yaw = Math.atan2(d[0], -d[2]) / DEG;
+  return { yaw, pitch };
 }
 
 // --- capture loop ---
-function angularDistance(a, b) {
-  // both in degrees, on sphere (yaw,pitch). use haversine-ish approximation.
-  const toRad = Math.PI / 180;
-  const φ1 = a.pitch * toRad, φ2 = b.pitch * toRad;
-  const dφ = (b.pitch - a.pitch) * toRad;
-  const dλ = (b.yaw - a.yaw) * toRad;
-  const h = Math.sin(dφ/2)**2 + Math.cos(φ1)*Math.cos(φ2)*Math.sin(dλ/2)**2;
-  return 2 * Math.asin(Math.min(1, Math.sqrt(h))) * 180 / Math.PI;
-}
-
 function captureLoop(ts) {
   if (!state.video) return;
   drawOverlay();
-  const here = cameraOrientation();
 
-  // find nearest uncaptured target
-  let best = null, bestDist = Infinity;
+  // Find nearest uncaptured target via dot product against the camera forward
+  // direction — avoids any Euler decomposition.
+  const f = cameraForwardUserWorld();
+  let best = null, bestDot = -Infinity;
   for (const t of state.targets) {
     if (t.captured) continue;
-    const d = angularDistance(here, t);
-    if (d < bestDist) { bestDist = d; best = t; }
+    const td = targetDirUserWorld(t.yaw, t.pitch);
+    const d = f[0]*td[0] + f[1]*td[1] + f[2]*td[2];
+    if (d > bestDot) { bestDot = d; best = t; }
   }
-
+  const bestDist = Math.acos(Math.max(-1, Math.min(1, bestDot))) / DEG;
   const aligned = best && bestDist < ALIGN_TOLERANCE_DEG;
   if (aligned) {
     if (state.alignedTarget !== best) {
@@ -195,13 +203,26 @@ function captureLoop(ts) {
 function grabFrame(target) {
   state.capturing = true;
   const v = state.video;
-  const w = v.videoWidth, h = v.videoHeight;
-  if (!w || !h) { state.capturing = false; return; }
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw || !vh) { state.capturing = false; return; }
+
+  // Always normalize the captured canvas into "portrait" orientation so that
+  // pixel +X = device +X (right edge) and pixel +Y = device -Y (down). On iOS
+  // Safari the raw stream is often the sensor's native landscape (vw > vh);
+  // rotate it 90° clockwise so the captured frame matches the device pose.
   const canvas = document.createElement('canvas');
-  canvas.width = w; canvas.height = h;
-  canvas.getContext('2d').drawImage(v, 0, 0, w, h);
-  const here = cameraOrientation();
-  state.captures.push({ canvas, yaw: here.yaw, pitch: here.pitch, roll: here.roll });
+  const ctx0 = canvas.getContext('2d');
+  if (vh >= vw) {
+    canvas.width = vw; canvas.height = vh;
+    ctx0.drawImage(v, 0, 0, vw, vh);
+  } else {
+    canvas.width = vh; canvas.height = vw;
+    ctx0.translate(vh, 0);
+    ctx0.rotate(Math.PI / 2);
+    ctx0.drawImage(v, 0, 0, vw, vh);
+  }
+
+  state.captures.push({ canvas, R: currentRwd() });
   target.captured = true;
   $('counter').textContent = `${state.captures.filter(()=>true).length} / ${state.targets.length}`;
   setTimeout(() => { state.capturing = false; }, 250);
@@ -219,15 +240,16 @@ function drawOverlay() {
   const ctx = c.getContext('2d');
   ctx.clearRect(0, 0, W, H);
 
-  const here = cameraOrientation();
-  const R = rotMatWorldToCamera(here.yaw, here.pitch, here.roll);
+  const Rwd = currentRwd();
   const fx = (W / 2) / Math.tan(FOV_X_DEG / 2 * DEG);
   const fy = (H / 2) / Math.tan(FOV_Y_DEG / 2 * DEG);
 
+  // Project a user-world direction (yaw, pitch) into screen pixels.
+  // td = Rwd · target_userworld; back camera looks down -Z, so visible iff td.z < 0.
   const project = (worldYaw, worldPitch) => {
-    const v = rv(R, dirYawPitch(worldYaw, worldPitch));
-    if (v[2] <= 0.05) return null; // behind camera
-    return { x: W/2 + fx * v[0] / v[2], y: H/2 - fy * v[1] / v[2], depth: v[2] };
+    const td = applyMat(Rwd, targetDirUserWorld(worldYaw, worldPitch));
+    if (td[2] >= -0.05) return null;
+    return { x: W/2 + fx * td[0] / (-td[2]), y: H/2 - fy * td[1] / (-td[2]) };
   };
 
   // horizon line (great circle at pitch=0) — gives a stable visual anchor
@@ -371,8 +393,7 @@ function teardownAndReset() {
   if (state.wakeLock) { try { state.wakeLock.release(); } catch {} state.wakeLock = null; }
   state.captures = [];
   state.targets = buildTargets();
-  state.yawOffset = null;
-  state.compassHeading = null;
+  state.initialR = null;
   $('counter').textContent = `0 / ${state.targets.length}`;
   show('start-screen');
 }
